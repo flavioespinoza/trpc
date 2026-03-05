@@ -189,9 +189,12 @@ export function ipcLink<TRouter extends AnyRouter>(
       return observable((observer) => {
         // Subscriptions are not supported over IPC
         if (op.type === 'subscription') {
-          throw new Error(
-            'Subscriptions are unsupported by `ipcLink` — use `wsLink` or `httpSubscriptionLink`',
+          observer.error(
+            new TRPCClientError(
+              'Subscriptions are unsupported by `ipcLink` — use `wsLink` or `httpSubscriptionLink`',
+            ),
           );
+          return;
         }
 
         // If child is already dead, fail immediately
