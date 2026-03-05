@@ -5,6 +5,7 @@ import type {
   AnyClientTypes,
   AnyRouter,
   CombinedDataTransformer,
+  Maybe,
   TRPCResponse,
 } from '@trpc/server/unstable-core-do-not-import';
 import { transformResult } from '@trpc/server/unstable-core-do-not-import';
@@ -88,6 +89,36 @@ interface PendingRequest {
   resolve: (value: IPCResult) => void;
   reject: (reason: unknown) => void;
 }
+
+/**
+ * Polyfill for DOMException with AbortError name
+ */
+class AbortError extends Error {
+  constructor() {
+    const name = 'AbortError';
+    super(name);
+    this.name = name;
+    this.message = name;
+  }
+}
+
+/**
+ * Polyfill for `signal.throwIfAborted()`
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/throwIfAborted
+ */
+const throwIfAborted = (signal: Maybe<AbortSignal>) => {
+  if (!signal?.aborted) {
+    return;
+  }
+  signal.throwIfAborted?.();
+
+  if (typeof DOMException !== 'undefined') {
+    throw new DOMException('AbortError', 'AbortError');
+  }
+
+  throw new AbortError();
+};
 
 interface IPCClient {
   request: (op: Operation) => Promise<IPCResult>;
@@ -193,13 +224,58 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
   };
 
   const request = (op: Operation): Promise<IPCResult> => {
-    return new Promise<IPCResult>((resolve, reject) => {
+    return new Promise<IPCResult>((_resolve, _reject) => {
+      const { signal } = op;
+
+      try {
+        throwIfAborted(signal);
+      } catch (cause) {
+        _reject(cause);
+        return;
+      }
+
       let proc: ChildProcess;
       try {
         proc = getChild();
       } catch (cause) {
-        reject(cause);
+        _reject(cause);
         return;
+      }
+
+      let settled = false;
+      let onAbort: (() => void) | undefined;
+
+      const cleanup = () => {
+        if (onAbort) {
+          signal?.removeEventListener('abort', onAbort);
+          onAbort = undefined;
+        }
+      };
+
+      const resolve = (value: IPCResult) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        _resolve(value);
+      };
+
+      const reject = (reason: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        _reject(reason);
+      };
+
+      if (signal) {
+        onAbort = () => {
+          pending.delete(op.id);
+          try {
+            throwIfAborted(signal);
+          } catch (cause) {
+            reject(cause);
+          }
+        };
+        signal.addEventListener('abort', onAbort);
       }
 
       const serializedInput =
