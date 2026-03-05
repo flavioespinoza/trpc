@@ -158,12 +158,17 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
     });
 
     proc.once('exit', (code, signal) => {
+      // Clear `child` but NOT `spawnError` - a crash after successful spawn
+      // is transient. The next request will spawn a fresh process. If the
+      // process fails to spawn at all, the `error` handler above caches that
+      // permanently.
       child = null;
-      const cause = new Error(
-        `ipcLink: child process exited (code=${code}, signal=${signal})`,
+      buffer = '';
+      rejectAll(
+        new Error(
+          `ipcLink: child process exited (code=${code}, signal=${signal})`,
+        ),
       );
-      spawnError = spawnError ?? cause;
-      rejectAll(cause);
     });
 
     proc.stdout?.setEncoding('utf8');
