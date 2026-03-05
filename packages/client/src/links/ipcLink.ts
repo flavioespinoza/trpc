@@ -2,9 +2,9 @@ import type { ChildProcess, SpawnOptions } from 'child_process';
 import { spawn } from 'child_process';
 import { observable } from '@trpc/server/observable';
 import type {
-  AnyClientTypes,
   AnyRouter,
   CombinedDataTransformer,
+  inferClientTypes,
   Maybe,
   TRPCResponse,
 } from '@trpc/server/unstable-core-do-not-import';
@@ -15,11 +15,9 @@ import { getTransformer } from '../unstable-internals';
 import type { Operation, TRPCLink } from './types';
 
 /**
- * @internal
+ * Options for {@link createIPCClient}.
  */
-export type IPCLinkBaseOptions<
-  TRoot extends Pick<AnyClientTypes, 'transformer'>,
-> = {
+export interface IPCClientOptions {
   /**
    * The command to spawn. If `args` is omitted, this can include arguments
    * (parsed by the shell when `spawnOptions.shell` is true) or is treated as
@@ -35,28 +33,6 @@ export type IPCLinkBaseOptions<
    * `stdio` is always overridden to `['pipe', 'pipe', 'inherit']`.
    */
   spawnOptions?: Omit<SpawnOptions, 'stdio'>;
-} & TransformerOptions<TRoot>;
-
-export type IPCLinkOptions<TRouter extends AnyRouter> = IPCLinkBaseOptions<
-  TRouter['_def']['_config']['$types']
->;
-
-interface ResolvedIPCLinkOptions {
-  command: string;
-  args: readonly string[];
-  spawnOptions: Omit<SpawnOptions, 'stdio'>;
-  transformer: CombinedDataTransformer;
-}
-
-function resolveIPCLinkOptions(
-  opts: IPCLinkBaseOptions<AnyClientTypes>,
-): ResolvedIPCLinkOptions {
-  return {
-    command: opts.command,
-    args: opts.args ?? [],
-    spawnOptions: opts.spawnOptions ?? {},
-    transformer: getTransformer(opts.transformer),
-  };
 }
 
 /**
@@ -120,13 +96,51 @@ const throwIfAborted = (signal: Maybe<AbortSignal>) => {
   throw new AbortError();
 };
 
-interface IPCClient {
-  request: (op: Operation) => Promise<IPCResult>;
+/**
+ * A persistent child-process client that speaks newline-delimited JSON over
+ * stdin/stdout. The consumer owns the lifecycle: call {@link close} to kill
+ * the child and reject any in-flight requests.
+ */
+export interface TRPCIPCClient {
+  /**
+   * Send a tRPC operation to the child process. The `transformer` is used to
+   * serialize the operation's input before writing to stdin.
+   */
+  request: (
+    op: Operation,
+    transformer: CombinedDataTransformer,
+  ) => Promise<IPCResult>;
+  /**
+   * Ends stdin, kills the child process, and rejects all pending requests.
+   * After calling this, subsequent `request()` calls will reject immediately.
+   */
+  close: () => void;
 }
 
-function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
+/**
+ * Creates a persistent child-process client for use with {@link ipcLink}.
+ *
+ * The process is spawned lazily on the first `request()` call. The consumer
+ * must call `close()` to terminate the child and release resources; otherwise
+ * the child process will outlive the parent on some platforms.
+ *
+ * @example
+ * ```ts
+ * const client = createIPCClient({ command: 'node', args: ['server.js'] });
+ * const trpc = createTRPCClient<AppRouter>({
+ *   links: [ipcLink({ client })],
+ * });
+ * // ...
+ * client.close();
+ * ```
+ */
+export function createIPCClient(opts: IPCClientOptions): TRPCIPCClient {
+  const args = opts.args ?? [];
+  const spawnOptions = opts.spawnOptions ?? {};
+
   let child: ChildProcess | null = null;
   let spawnError: Error | null = null;
+  let closed = false;
   let buffer = '';
   const pending = new Map<number, PendingRequest>();
 
@@ -184,6 +198,9 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
   };
 
   const getChild = (): ChildProcess => {
+    if (closed) {
+      throw new Error('IPC client is closed');
+    }
     if (spawnError) {
       throw spawnError;
     }
@@ -191,8 +208,8 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
       return child;
     }
 
-    const proc = spawn(opts.command, opts.args as string[], {
-      ...opts.spawnOptions,
+    const proc = spawn(opts.command, args as string[], {
+      ...spawnOptions,
       stdio: ['pipe', 'pipe', 'inherit'],
     });
 
@@ -223,7 +240,10 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
     return proc;
   };
 
-  const request = (op: Operation): Promise<IPCResult> => {
+  const request = (
+    op: Operation,
+    transformer: CombinedDataTransformer,
+  ): Promise<IPCResult> => {
     return new Promise<IPCResult>((_resolve, _reject) => {
       const { signal } = op;
 
@@ -281,7 +301,7 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
       const serializedInput =
         op.input === undefined
           ? undefined
-          : opts.transformer.input.serialize(op.input);
+          : transformer.input.serialize(op.input);
 
       const envelope: IPCRequestEnvelope = {
         id: op.id,
@@ -309,15 +329,46 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
     });
   };
 
-  return { request };
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+
+    if (child) {
+      child.stdin?.end();
+      child.kill();
+      child = null;
+    }
+    buffer = '';
+
+    rejectAllPending(new Error('IPC client is closed'));
+  };
+
+  return { request, close };
 }
 
+export type IPCLinkOptions<TRouter extends AnyRouter> = {
+  client: TRPCIPCClient;
+} & TransformerOptions<inferClientTypes<TRouter>>;
+
 /**
- * A terminating link that spawns a persistent child process and exchanges
- * tRPC operations with it over newline-delimited JSON on stdin/stdout.
+ * A terminating link that exchanges tRPC operations with a child process over
+ * newline-delimited JSON on stdin/stdout.
+ *
+ * The consumer creates and owns the process lifecycle via {@link createIPCClient}:
+ *
+ * ```ts
+ * const client = createIPCClient({ command: 'node', args: ['server.js'] });
+ * const trpc = createTRPCClient<AppRouter>({
+ *   links: [ipcLink({ client })],
+ * });
+ * // ...
+ * client.close();
+ * ```
  *
  * Request envelopes written to stdin have the shape:
- *   { id, method, params: { path, input } }
+ *   `{ id, method, params: { path, input } }`
  *
  * Response envelopes read from stdout must echo the `id` and contain a
  * standard tRPC result/error payload.
@@ -325,8 +376,8 @@ function createIPCClient(opts: ResolvedIPCLinkOptions): IPCClient {
 export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
   opts: IPCLinkOptions<TRouter>,
 ): TRPCLink<TRouter> {
-  const resolvedOpts = resolveIPCLinkOptions(opts);
-  const client = createIPCClient(resolvedOpts);
+  const { client } = opts;
+  const transformer = getTransformer(opts.transformer);
 
   return () => {
     return ({ op }) => {
@@ -342,12 +393,12 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
         let meta: IPCResult['meta'] | undefined = undefined;
 
         client
-          .request(op)
+          .request(op, transformer)
           .then((res) => {
             meta = res.meta;
             const transformed = transformResult(
               res.json,
-              resolvedOpts.transformer.output,
+              transformer.output,
             );
 
             if (!transformed.ok) {
