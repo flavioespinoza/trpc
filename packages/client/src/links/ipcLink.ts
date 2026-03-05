@@ -3,6 +3,7 @@ import { observable } from '@trpc/server/observable';
 import type {
   AnyRouter,
   inferClientTypes,
+  Maybe,
   TRPCResponse,
 } from '@trpc/server/unstable-core-do-not-import';
 import { transformResult } from '@trpc/server/unstable-core-do-not-import';
@@ -51,6 +52,39 @@ interface PendingRequest {
 }
 
 /**
+ * Polyfill for DOMException with AbortError name
+ */
+class AbortError extends Error {
+  constructor() {
+    const name = 'AbortError';
+    super(name);
+    this.name = name;
+    this.message = name;
+  }
+}
+
+/**
+ * Polyfill for `signal.throwIfAborted()`
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/throwIfAborted
+ */
+const throwIfAborted = (signal: Maybe<AbortSignal>) => {
+  if (!signal?.aborted) {
+    return;
+  }
+  // If available, use the native implementation
+  signal.throwIfAborted?.();
+
+  // If we have `DOMException`, use it
+  if (typeof DOMException !== 'undefined') {
+    throw new DOMException('AbortError', 'AbortError');
+  }
+
+  // Otherwise, use our own implementation
+  throw new AbortError();
+};
+
+/**
  * A terminating link that spawns a persistent child process and communicates
  * tRPC operations over stdio using newline-delimited JSON.
  *
@@ -72,10 +106,12 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
   const pending = new Map<number, PendingRequest>();
 
   const rejectAll = (cause: unknown) => {
-    for (const [, req] of pending) {
+    // Snapshot before iterating - req.reject() calls cleanup() which
+    // mutates the map.
+    const reqs = [...pending.values()];
+    for (const req of reqs) {
       req.reject(cause);
     }
-    pending.clear();
   };
 
   const handleLine = (line: string) => {
@@ -96,7 +132,6 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
       // Response for unknown id - ignore.
       return;
     }
-    pending.delete(msg.id);
     req.resolve({
       json: msg,
       meta: {
@@ -149,6 +184,8 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
 
   const ipcRequest = (op: Operation): Promise<IPCResult> => {
     return new Promise((resolve, reject) => {
+      throwIfAborted(op.signal);
+
       start();
 
       if (spawnError) {
@@ -172,12 +209,44 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
         },
       };
 
-      pending.set(op.id, { resolve, reject });
+      let onAbort: (() => void) | undefined;
+      const cleanup = () => {
+        pending.delete(op.id);
+        if (onAbort) {
+          op.signal?.removeEventListener('abort', onAbort);
+        }
+      };
+
+      pending.set(op.id, {
+        resolve: (value) => {
+          cleanup();
+          resolve(value);
+        },
+        reject: (cause) => {
+          cleanup();
+          reject(cause);
+        },
+      });
+
+      if (op.signal) {
+        onAbort = () => {
+          // We can't un-send bytes already written to stdin; the child may
+          // still reply, but by then pending.get(id) is undefined and the
+          // response is dropped.
+          cleanup();
+          try {
+            throwIfAborted(op.signal);
+          } catch (cause) {
+            reject(cause);
+          }
+        };
+        op.signal.addEventListener('abort', onAbort);
+      }
 
       try {
         child.stdin.write(JSON.stringify(message) + '\n');
       } catch (cause) {
-        pending.delete(op.id);
+        cleanup();
         reject(cause);
       }
     });
