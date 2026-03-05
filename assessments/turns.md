@@ -17,3 +17,19 @@ Note: Each turn is written after reviewing the previous response. Only Turn 2 is
 **Model B:**
 
 > I'm confused by your JSON parsing logic. Could you walk me through this? Because if that's true, doesn't that mean that one failure will cause everything to fail? So unless I'm missing something, if one fails, they all fail. I don't think one stray console log should crash the rest of the in-flight requests.
+
+---
+
+## Turn 3
+
+**Model A:**
+
+> Okay, I understand now. That makes sense.
+>
+> One other thing — I noticed that in your `observer.next()` call, you're only passing the `result` but you're not including `context`. If you look at how `httpLink` does it, it passes `context: res.meta` so that downstream consumers can access response metadata. Right now anything that depends on that context is just going to get `undefined`. Was there a reason you left that out?
+
+**Model B:**
+
+> Okay, fair enough — fail-fast makes sense if you can't trust the stream anymore. I get it.
+>
+> Different thing — I was looking at your `pending` map and the observer type you're storing in it. It looks like you've got this conditional type that just resolves to `any`. Why not just type it as `any` directly, or better yet, use the actual observer type? It feels like unnecessary complexity for no type safety gain.
