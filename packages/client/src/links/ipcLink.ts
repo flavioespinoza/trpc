@@ -2,6 +2,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { observable } from '@trpc/server/observable';
 import type {
   AnyRouter,
+  CombinedDataTransformer,
   inferClientTypes,
   Maybe,
   TRPCResponse,
@@ -10,9 +11,13 @@ import { transformResult } from '@trpc/server/unstable-core-do-not-import';
 import { TRPCClientError } from '../TRPCClientError';
 import type { TransformerOptions } from '../unstable-internals';
 import { getTransformer } from '../unstable-internals';
-import type { Operation, TRPCLink } from './types';
+import type {
+  Operation,
+  OperationResultEnvelope,
+  TRPCLink,
+} from './types';
 
-export type IPCLinkOptions<TRouter extends AnyRouter> = {
+export interface IPCClientOptions {
   /**
    * The command to spawn.
    */
@@ -26,7 +31,7 @@ export type IPCLinkOptions<TRouter extends AnyRouter> = {
    * `stdio` is always forced to `['pipe', 'pipe', 'inherit']`.
    */
   spawnOptions?: Omit<SpawnOptions, 'stdio'>;
-} & TransformerOptions<inferClientTypes<TRouter>>;
+}
 
 interface IPCRequestMessage {
   id: number;
@@ -84,50 +89,56 @@ const throwIfAborted = (signal: Maybe<AbortSignal>) => {
   throw new AbortError();
 };
 
+class TRPCIPCClosedError extends Error {
+  constructor() {
+    super('ipcLink: client was closed');
+    this.name = 'TRPCIPCClosedError';
+  }
+}
+
 /**
- * A terminating link that spawns a persistent child process and communicates
- * tRPC operations over stdio using newline-delimited JSON.
+ * Manages a persistent child process and correlates tRPC operations to
+ * newline-delimited JSON responses over stdio.
  *
- * Each operation is written to the child's stdin as a single JSON line, and
- * responses are read from stdout as newline-delimited JSON. Responses are
- * correlated to requests by `id`.
- *
- * @see https://trpc.io/docs/client/links/ipcLink
+ * The process is spawned lazily on the first request. If it crashes, the
+ * next request will spawn a fresh one. Call `close()` to kill the child
+ * and reject any in-flight requests.
  */
-export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
-  opts: IPCLinkOptions<TRouter>,
-): TRPCLink<TRouter> {
-  const transformer = getTransformer(opts.transformer);
+class IpcClient {
+  private child: ChildProcess | null = null;
+  private spawnError: Error | null = null;
+  private closed = false;
+  private buffer = '';
+  private pending = new Map<number, PendingRequest>();
+  private opts: IPCClientOptions;
 
-  let child: ChildProcess | null = null;
-  let spawnError: Error | null = null;
-  let buffer = '';
+  constructor(opts: IPCClientOptions) {
+    this.opts = opts;
+  }
 
-  const pending = new Map<number, PendingRequest>();
-
-  const rejectAll = (cause: unknown) => {
+  private rejectAll(cause: unknown) {
     // Snapshot before iterating - req.reject() calls cleanup() which
     // mutates the map.
-    const reqs = [...pending.values()];
+    const reqs = [...this.pending.values()];
     for (const req of reqs) {
       req.reject(cause);
     }
-  };
+  }
 
-  const handleLine = (line: string) => {
+  private handleLine(line: string) {
     let msg: IPCResponseMessage;
     try {
       msg = JSON.parse(line);
     } catch (cause) {
       // Malformed JSON from child - reject everything in flight since we
       // can no longer correlate responses.
-      rejectAll(
+      this.rejectAll(
         new Error(`ipcLink: failed to parse response JSON: ${String(cause)}`),
       );
       return;
     }
 
-    const req = pending.get(msg.id);
+    const req = this.pending.get(msg.id);
     if (!req) {
       // Response for unknown id - ignore.
       return;
@@ -138,23 +149,23 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
         responseJSON: msg,
       },
     });
-  };
+  }
 
-  const start = () => {
-    if (child || spawnError) {
+  private start() {
+    if (this.child || this.spawnError || this.closed) {
       return;
     }
 
-    const proc = spawn(opts.command, opts.args ?? [], {
-      ...opts.spawnOptions,
+    const proc = spawn(this.opts.command, this.opts.args ?? [], {
+      ...this.opts.spawnOptions,
       stdio: ['pipe', 'pipe', 'inherit'],
     });
-    child = proc;
+    this.child = proc;
 
     proc.once('error', (err) => {
-      spawnError = err;
-      child = null;
-      rejectAll(err);
+      this.spawnError = err;
+      this.child = null;
+      this.rejectAll(err);
     });
 
     proc.once('exit', (code, signal) => {
@@ -162,9 +173,9 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
       // is transient. The next request will spawn a fresh process. If the
       // process fails to spawn at all, the `error` handler above caches that
       // permanently.
-      child = null;
-      buffer = '';
-      rejectAll(
+      this.child = null;
+      this.buffer = '';
+      this.rejectAll(
         new Error(
           `ipcLink: child process exited (code=${code}, signal=${signal})`,
         ),
@@ -173,33 +184,41 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
 
     proc.stdout?.setEncoding('utf8');
     proc.stdout?.on('data', (chunk: string) => {
-      buffer += chunk;
+      this.buffer += chunk;
 
       // Only emit complete messages - newline-terminated lines.
       let newlineIndex: number;
-      while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
+      while ((newlineIndex = this.buffer.indexOf('\n')) !== -1) {
+        const line = this.buffer.slice(0, newlineIndex);
+        this.buffer = this.buffer.slice(newlineIndex + 1);
         if (line.length > 0) {
-          handleLine(line);
+          this.handleLine(line);
         }
       }
     });
-  };
+  }
 
-  const ipcRequest = (op: Operation): Promise<IPCResult> => {
+  private ipcRequest(
+    op: Operation,
+    transformer: CombinedDataTransformer,
+  ): Promise<IPCResult> {
     return new Promise((resolve, reject) => {
       throwIfAborted(op.signal);
 
-      start();
+      if (this.closed) {
+        reject(new TRPCIPCClosedError());
+        return;
+      }
 
-      if (spawnError) {
-        reject(spawnError);
+      this.start();
+
+      if (this.spawnError) {
+        reject(this.spawnError);
         return;
       }
 
       /* istanbul ignore if -- @preserve */
-      if (!child?.stdin) {
+      if (!this.child?.stdin) {
         reject(new Error('ipcLink: child process stdin is not available'));
         return;
       }
@@ -216,13 +235,13 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
 
       let onAbort: (() => void) | undefined;
       const cleanup = () => {
-        pending.delete(op.id);
+        this.pending.delete(op.id);
         if (onAbort) {
           op.signal?.removeEventListener('abort', onAbort);
         }
       };
 
-      pending.set(op.id, {
+      this.pending.set(op.id, {
         resolve: (value) => {
           cleanup();
           resolve(value);
@@ -249,55 +268,133 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
       }
 
       try {
-        child.stdin.write(JSON.stringify(message) + '\n');
+        this.child.stdin.write(JSON.stringify(message) + '\n');
       } catch (cause) {
         cleanup();
         reject(cause);
       }
     });
-  };
+  }
 
+  /**
+   * Issues a single tRPC operation to the child process and returns an
+   * observable that emits exactly one result (or errors).
+   *
+   * The transformer is passed in per-request (not stored on the client)
+   * so that `ipcLink` remains the single place that resolves transformer
+   * options - mirrors `WsClient.request()`.
+   */
+  public request({
+    op,
+    transformer,
+  }: {
+    op: Operation;
+    transformer: CombinedDataTransformer;
+  }) {
+    return observable<
+      OperationResultEnvelope<unknown, TRPCClientError<AnyRouter>>,
+      TRPCClientError<AnyRouter>
+    >((observer) => {
+      const { type } = op;
+      /* istanbul ignore if -- @preserve */
+      if (type === 'subscription') {
+        throw new Error(
+          'Subscriptions are unsupported by `ipcLink` - use `httpSubscriptionLink` or `wsLink`',
+        );
+      }
+
+      let meta: IPCResult['meta'] | undefined = undefined;
+      this.ipcRequest(op, transformer)
+        .then((res) => {
+          meta = res.meta;
+          const transformed = transformResult(res.json, transformer.output);
+
+          if (!transformed.ok) {
+            observer.error(
+              TRPCClientError.from(transformed.error, {
+                meta,
+              }),
+            );
+            return;
+          }
+          observer.next({
+            context: res.meta,
+            result: transformed.result,
+          });
+          observer.complete();
+        })
+        .catch((cause) => {
+          observer.error(TRPCClientError.from(cause, { meta }));
+        });
+
+      return () => {
+        // noop
+      };
+    });
+  }
+
+  /**
+   * Closes the IPC client: rejects all in-flight requests, kills the
+   * child process, and prevents any further requests.
+   *
+   * The returned promise resolves once the child has actually exited
+   * (or immediately if no child was ever spawned).
+   */
+  public close(): Promise<void> {
+    if (this.closed) {
+      return Promise.resolve();
+    }
+    this.closed = true;
+
+    this.rejectAll(new TRPCIPCClosedError());
+
+    const proc = this.child;
+    if (!proc) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      proc.once('exit', () => resolve());
+      proc.kill();
+    });
+  }
+}
+
+export function createIPCClient(opts: IPCClientOptions) {
+  return new IpcClient(opts);
+}
+
+export type TRPCIPCClient = ReturnType<typeof createIPCClient>;
+
+export type IPCLinkOptions<TRouter extends AnyRouter> = {
+  client: TRPCIPCClient;
+} & TransformerOptions<inferClientTypes<TRouter>>;
+
+/**
+ * A terminating link that talks to a child process over stdio using
+ * newline-delimited JSON. The child process lifecycle is managed by a
+ * separate `TRPCIPCClient` (created via `createIPCClient`), which
+ * exposes `.close()` for graceful shutdown.
+ *
+ * @see https://trpc.io/docs/client/links/ipcLink
+ */
+export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
+  opts: IPCLinkOptions<TRouter>,
+): TRPCLink<TRouter> {
+  const { client } = opts;
+  const transformer = getTransformer(opts.transformer);
   return () => {
     return ({ op }) => {
       return observable((observer) => {
-        const { type } = op;
-        /* istanbul ignore if -- @preserve */
-        if (type === 'subscription') {
-          throw new Error(
-            'Subscriptions are unsupported by `ipcLink` - use `httpSubscriptionLink` or `wsLink`',
-          );
-        }
-
-        const request = ipcRequest(op);
-        let meta: IPCResult['meta'] | undefined = undefined;
-        request
-          .then((res) => {
-            meta = res.meta;
-            const transformed = transformResult(
-              res.json,
-              transformer.output,
-            );
-
-            if (!transformed.ok) {
-              observer.error(
-                TRPCClientError.from(transformed.error, {
-                  meta,
-                }),
-              );
-              return;
-            }
-            observer.next({
-              context: res.meta,
-              result: transformed.result,
-            });
-            observer.complete();
+        const requestSubscription = client
+          .request({
+            op,
+            transformer,
           })
-          .catch((cause) => {
-            observer.error(TRPCClientError.from(cause, { meta }));
-          });
+          .subscribe(observer);
 
         return () => {
-          // noop
+          requestSubscription.unsubscribe();
         };
       });
     };
