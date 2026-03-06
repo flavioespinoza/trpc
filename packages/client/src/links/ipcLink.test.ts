@@ -4,7 +4,7 @@ import { initTRPC } from '@trpc/server';
 import { z } from 'zod';
 import { createTRPCClient } from '../createTRPCClient';
 import { TRPCClientError } from '../TRPCClientError';
-import { ipcLink } from './ipcLink';
+import { createIPCClient, ipcLink, type TRPCIPCClient } from './ipcLink';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ECHO_SERVER = path.resolve(__dirname, '../../test/mocks/echo-server.js');
@@ -18,47 +18,31 @@ const appRouter = t.router({
   echo: t.procedure.input(z.any()).query(({ input }) => input as unknown),
   __hang__: t.procedure.query(() => undefined),
   __crash__: t.procedure.mutation(() => undefined),
-  __close__: t.procedure.mutation(() => undefined),
 });
 type AppRouter = typeof appRouter;
 
 /**
- * Test helper that wires a tRPC client to a fresh echo-server child
- * process via ipcLink. Returns the client plus a `close()` that shuts
- * the child down gracefully so tests don't leave orphaned processes.
- */
-function createIPCClient() {
-  const client = createTRPCClient<AppRouter>({
-    links: [
-      ipcLink({
-        command: process.execPath,
-        args: [ECHO_SERVER],
-      }),
-    ],
-  });
-
-  const close = async () => {
-    // Swallow errors: the process may already be dead (e.g. after a
-    // crash test), in which case the request will reject. That's fine -
-    // the goal is just to make sure the child is gone.
-    await client.__close__.mutate().catch(() => {
-      // noop
-    });
-  };
-
-  return { client, close };
-}
-
-/**
- * Track every client created during a test so `afterEach` can close
+ * Track every IPC client created during a test so `afterEach` can close
  * them all - zero orphaned child processes, even if a test throws.
+ *
+ * close() uses the TRPCIPCClient.close() method, which kills the child
+ * directly via proc.kill() - no dependency on the server supporting a
+ * magic shutdown path.
  */
-let openClients: Array<ReturnType<typeof createIPCClient>> = [];
+let openClients: TRPCIPCClient[] = [];
 
 function makeClient() {
-  const ctx = createIPCClient();
-  openClients.push(ctx);
-  return ctx;
+  const ipcClient = createIPCClient({
+    command: process.execPath,
+    args: [ECHO_SERVER],
+  });
+  openClients.push(ipcClient);
+
+  const client = createTRPCClient<AppRouter>({
+    links: [ipcLink({ client: ipcClient })],
+  });
+
+  return { client, ipcClient };
 }
 
 afterEach(async () => {
@@ -172,12 +156,13 @@ test('process crash: spawn failure rejects with cached error', async () => {
   // Point at a binary that does not exist. The `error` event should
   // fire, cache the spawn error, and every request should reject
   // immediately with that cached error.
+  const ipcClient = createIPCClient({
+    command: '/definitely/not/a/real/binary',
+  });
+  openClients.push(ipcClient);
+
   const client = createTRPCClient<AppRouter>({
-    links: [
-      ipcLink({
-        command: '/definitely/not/a/real/binary',
-      }),
-    ],
+    links: [ipcLink({ client: ipcClient })],
   });
 
   const err1 = await client.echo.query('a').catch((e) => e);
@@ -185,6 +170,32 @@ test('process crash: spawn failure rejects with cached error', async () => {
 
   expect(err1).toBeInstanceOf(TRPCClientError);
   expect(err2).toBeInstanceOf(TRPCClientError);
+});
 
-  // No child was ever spawned, so nothing to close.
+test('close: rejects in-flight requests and blocks new ones', async () => {
+  const { client, ipcClient } = makeClient();
+
+  // Prove the connection works first.
+  expect(await client.echo.query('before')).toBe('before');
+
+  // Start a request that won't resolve before close(). Attach .catch()
+  // eagerly - the rejection fires DURING `await ipcClient.close()` below,
+  // and if there's no handler on the promise yet, vitest flags it as an
+  // unhandled rejection.
+  const hanging = client.__hang__.query().catch((e) => e);
+
+  await ipcClient.close();
+
+  const hangErr = await hanging;
+  expect(hangErr).toBeInstanceOf(TRPCClientError);
+  expect((hangErr as TRPCClientError<AppRouter>).message).toMatch(
+    /client was closed/,
+  );
+
+  // Further requests reject immediately - no new spawn.
+  const afterErr = await client.echo.query('after').catch((e: unknown) => e);
+  expect(afterErr).toBeInstanceOf(TRPCClientError);
+  expect((afterErr as TRPCClientError<AppRouter>).message).toMatch(
+    /client was closed/,
+  );
 });
