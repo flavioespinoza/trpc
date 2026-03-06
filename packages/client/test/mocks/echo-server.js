@@ -4,9 +4,13 @@
  * Reads newline-delimited JSON from stdin, echoes back a valid tRPC
  * response envelope with the same id and the input as the result data.
  *
- * Protocol:
- *   IN:  {"id":1,"method":"query","params":{"path":"hello","input":"world"}}
- *   OUT: {"id":1,"result":{"type":"data","data":"world"}}
+ * Special paths:
+ *   __generate — input must be a number N; responds with a string of N 'x' chars.
+ *                Tests NDJSON stdout buffering with large responses from small requests.
+ *
+ * Wire protocol:
+ *   IN:  {"id":1,"method":"query","params":{"path":"echo","input":"hello"}}
+ *   OUT: {"id":1,"result":{"type":"data","data":"hello"}}
  */
 
 let buffer = '';
@@ -30,11 +34,17 @@ process.stdin.on('data', (chunk) => {
       continue;
     }
 
+    let data = request.params.input;
+
+    if (request.params.path === '__generate') {
+      data = 'x'.repeat(Number(data));
+    }
+
     const response = {
       id: request.id,
       result: {
         type: 'data',
-        data: request.params.input,
+        data,
       },
     };
 
