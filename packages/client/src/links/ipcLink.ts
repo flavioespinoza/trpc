@@ -7,7 +7,7 @@
  *
  * DESIGN DECISIONS & ARCHITECTURAL ROLE:
  * * 1. ZERO-NETWORK LATENCY (stdio vs. fetch)
- * Standard tRPC links rely on the HTTP/network stack. To achieve the sub-millisecond 
+ * Standard tRPC links rely on the network stack. To achieve the sub-millisecond 
  * response times required for real-time Jitter Analysis and Red Screen triggers, 
  * Veritas bypasses the network entirely. This link spawns the sentinel-engine as a 
  * sub-process and communicates via standard input/output (stdio) pipes.
