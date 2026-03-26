@@ -28,7 +28,7 @@ import { initTRPC } from '@trpc/server';
 import { z } from 'zod';
 import { createTRPCClient } from '../createTRPCClient';
 import { TRPCClientError } from '../TRPCClientError';
-import { createIPCClient, ipcLink, type TRPCIPCClient } from './ipcLink';
+import { createIPCClient, ipcLink, type TRPCIPCClient } from './ipc-link';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ECHO_SERVER = path.resolve(__dirname, '../../test/mocks/echo-server.js');

@@ -218,6 +218,7 @@ class IpcClient {
     this.startWatchdog();
 
     proc.once('error', (err) => {
+      if (this.child !== proc) return;
       this.spawnError = err;
       this.child = null;
       this.stopWatchdog();
@@ -225,6 +226,7 @@ class IpcClient {
     });
 
     proc.once('exit', (code, signal) => {
+      if (this.child !== proc) return;
       this.child = null;
       this.buffer = '';
       this.stopWatchdog();
