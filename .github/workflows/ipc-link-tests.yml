@@ -1,0 +1,19 @@
+name: ipc-link-tests
+
+on:
+  push:
+    branches: [main, model_b]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-transport:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/setup
+
+      - name: run-transport-tests
+        run: pnpm vitest run packages/client/src/links/ipc-link.test.ts
