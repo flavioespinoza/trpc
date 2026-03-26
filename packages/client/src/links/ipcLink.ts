@@ -1,4 +1,30 @@
-
+/**
+ * @file ipcLink.ts
+ * @module packages/ipc-bridge
+ * @project Veritas Security Core
+ * * THE NERVOUS SYSTEM: This module serves as the critical high-performance bridge 
+ * between the React 'admin-shell' (The Face) and the C++ 'sentinel-engine' (The Brain).
+ *
+ * DESIGN DECISIONS & ARCHITECTURAL ROLE:
+ * * 1. ZERO-NETWORK LATENCY (stdio vs. fetch)
+ * Standard tRPC links rely on the HTTP/network stack. To achieve the sub-millisecond 
+ * response times required for real-time Jitter Analysis and Red Screen triggers, 
+ * Veritas bypasses the network entirely. This link spawns the sentinel-engine as a 
+ * sub-process and communicates via standard input/output (stdio) pipes.
+ * * 2. THE WATCHDOG (Self-Healing Logic)
+ * In high-stakes security, a "silent freeze" is as dangerous as a crash. We implemented 
+ * a state-aware Watchdog timer (`heartbeatTimeoutMs`). If the C++ engine stops 
+ * responding while requests are pending, the link identifies the "brain freeze," 
+ * force-kills the zombie process, and triggers an auto-restart on the next request.
+ * * 3. LINE-DELIMITED JSON BUFFERING
+ * Since C++ stdout chunks can arrive fragmented, this link implements a recursive 
+ * newline-delimited buffer. This ensures the tRPC client only attempts to parse 
+ * complete forensic payloads, preventing UI desync during heavy DSP loads.
+ * * 4. LOCAL-FIRST PRIVACY MANDATE
+ * By utilizing process pipes instead of a local WebSocket or loopback server, 
+ * raw audio fingerprints and threat metadata are physically incapable of being 
+ * sniffed by other local applications or remote attackers on the same network.
+ */
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { observable } from '@trpc/server/observable';
 import type {
