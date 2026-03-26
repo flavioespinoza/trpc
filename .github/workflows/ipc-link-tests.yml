@@ -1,4 +1,4 @@
-name: Veritas Core Tests
+name: IPC-link-tests
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  test-transport:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,6 +23,6 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
-      - name: Run IPC Bridge Tests
-        # We target the specific package to keep the CI fast
+      - name: Run Transport & Watchdog Tests
+        # Focuses strictly on the public IPC link logic
         run: npx vitest run packages/client/src/links/ipcLink.test.ts
