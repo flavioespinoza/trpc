@@ -1,4 +1,4 @@
-name: IPC-link-tests
+name: ipc-link-tests
 
 on:
   push:
@@ -11,18 +11,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
+      - name: checkout-code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: setup-node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install Dependencies
+      - name: install-dependencies
         run: npm install
 
-      - name: Run Transport & Watchdog Tests
-        # Focuses strictly on the public IPC link logic
-        run: npx vitest run packages/client/src/links/ipcLink.test.ts
+      - name: run-transport-tests
+        run: npx vitest run packages/client/src/links/ipc-link.test.ts
