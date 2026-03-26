@@ -1,3 +1,4 @@
+```typescript
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { observable } from '@trpc/server/observable';
 import type {
@@ -31,6 +32,12 @@ export interface IPCClientOptions {
    * `stdio` is always forced to `['pipe', 'pipe', 'inherit']`.
    */
   spawnOptions?: Omit<SpawnOptions, 'stdio'>;
+  /**
+   * Watchdog: Maximum time (ms) to wait for a response before 
+   * considering the process frozen and restarting it.
+   * Defaults to 5000ms.
+   */
+  heartbeatTimeoutMs?: number;
 }
 
 interface IPCRequestMessage {
@@ -54,11 +61,9 @@ interface IPCResult {
 interface PendingRequest {
   resolve: (value: IPCResult) => void;
   reject: (reason: unknown) => void;
+  startedAt: number;
 }
 
-/**
- * Polyfill for DOMException with AbortError name
- */
 class AbortError extends Error {
   constructor() {
     const name = 'AbortError';
@@ -68,24 +73,14 @@ class AbortError extends Error {
   }
 }
 
-/**
- * Polyfill for `signal.throwIfAborted()`
- *
- * @see https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/throwIfAborted
- */
 const throwIfAborted = (signal: Maybe<AbortSignal>) => {
   if (!signal?.aborted) {
     return;
   }
-  // If available, use the native implementation
   signal.throwIfAborted?.();
-
-  // If we have `DOMException`, use it
   if (typeof DOMException !== 'undefined') {
     throw new DOMException('AbortError', 'AbortError');
   }
-
-  // Otherwise, use our own implementation
   throw new AbortError();
 };
 
@@ -96,14 +91,13 @@ class TRPCIPCClosedError extends Error {
   }
 }
 
-/**
- * Manages a persistent child process and correlates tRPC operations to
- * newline-delimited JSON responses over stdio.
- *
- * The process is spawned lazily on the first request. If it crashes, the
- * next request will spawn a fresh one. Call `close()` to kill the child
- * and reject any in-flight requests.
- */
+class TRPCIPCWatchdogError extends Error {
+  constructor(timeout: number) {
+    super(`ipcLink: watchdog triggered after ${timeout}ms of silence`);
+    this.name = 'TRPCIPCWatchdogError';
+  }
+}
+
 class IpcClient {
   private child: ChildProcess | null = null;
   private spawnError: Error | null = null;
@@ -111,27 +105,27 @@ class IpcClient {
   private buffer = '';
   private pending = new Map<number, PendingRequest>();
   private opts: IPCClientOptions;
+  private lastActivityAt = 0;
+  private watchdogTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: IPCClientOptions) {
     this.opts = opts;
   }
 
   private rejectAll(cause: unknown) {
-    // Snapshot before iterating - req.reject() calls cleanup() which
-    // mutates the map.
     const reqs = [...this.pending.values()];
     for (const req of reqs) {
       req.reject(cause);
     }
+    this.pending.clear();
   }
 
   private handleLine(line: string) {
+    this.lastActivityAt = Date.now();
     let msg: IPCResponseMessage;
     try {
       msg = JSON.parse(line);
     } catch (cause) {
-      // Malformed JSON from child - reject everything in flight since we
-      // can no longer correlate responses.
       this.rejectAll(
         new Error(`ipcLink: failed to parse response JSON: ${String(cause)}`),
       );
@@ -140,7 +134,6 @@ class IpcClient {
 
     const req = this.pending.get(msg.id);
     if (!req) {
-      // Response for unknown id - ignore.
       return;
     }
     req.resolve({
@@ -149,6 +142,39 @@ class IpcClient {
         responseJSON: msg,
       },
     });
+  }
+
+  private startWatchdog() {
+    if (this.watchdogTimer) return;
+    const timeout = this.opts.heartbeatTimeoutMs ?? 5000;
+    
+    this.watchdogTimer = setInterval(() => {
+      if (this.pending.size === 0 || !this.child) return;
+
+      const now = Date.now();
+      const timeSinceActivity = now - this.lastActivityAt;
+
+      if (timeSinceActivity > timeout) {
+        const error = new TRPCIPCWatchdogError(timeout);
+        this.restart(error);
+      }
+    }, 1000);
+  }
+
+  private stopWatchdog() {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private restart(cause: Error) {
+    const proc = this.child;
+    this.child = null;
+    this.rejectAll(cause);
+    if (proc) {
+      proc.kill('SIGKILL');
+    }
   }
 
   private start() {
@@ -160,21 +186,22 @@ class IpcClient {
       ...this.opts.spawnOptions,
       stdio: ['pipe', 'pipe', 'inherit'],
     });
+    
     this.child = proc;
+    this.lastActivityAt = Date.now();
+    this.startWatchdog();
 
     proc.once('error', (err) => {
       this.spawnError = err;
       this.child = null;
+      this.stopWatchdog();
       this.rejectAll(err);
     });
 
     proc.once('exit', (code, signal) => {
-      // Clear `child` but NOT `spawnError` - a crash after successful spawn
-      // is transient. The next request will spawn a fresh process. If the
-      // process fails to spawn at all, the `error` handler above caches that
-      // permanently.
       this.child = null;
       this.buffer = '';
+      this.stopWatchdog();
       this.rejectAll(
         new Error(
           `ipcLink: child process exited (code=${code}, signal=${signal})`,
@@ -185,8 +212,6 @@ class IpcClient {
     proc.stdout?.setEncoding('utf8');
     proc.stdout?.on('data', (chunk: string) => {
       this.buffer += chunk;
-
-      // Only emit complete messages - newline-terminated lines.
       let newlineIndex: number;
       while ((newlineIndex = this.buffer.indexOf('\n')) !== -1) {
         const line = this.buffer.slice(0, newlineIndex);
@@ -217,7 +242,6 @@ class IpcClient {
         return;
       }
 
-      /* istanbul ignore if -- @preserve */
       if (!this.child?.stdin) {
         reject(new Error('ipcLink: child process stdin is not available'));
         return;
@@ -250,13 +274,11 @@ class IpcClient {
           cleanup();
           reject(cause);
         },
+        startedAt: Date.now(),
       });
 
       if (op.signal) {
         onAbort = () => {
-          // We can't un-send bytes already written to stdin; the child may
-          // still reply, but by then pending.get(id) is undefined and the
-          // response is dropped.
           cleanup();
           try {
             throwIfAborted(op.signal);
@@ -276,14 +298,6 @@ class IpcClient {
     });
   }
 
-  /**
-   * Issues a single tRPC operation to the child process and returns an
-   * observable that emits exactly one result (or errors).
-   *
-   * The transformer is passed in per-request (not stored on the client)
-   * so that `ipcLink` remains the single place that resolves transformer
-   * options - mirrors `WsClient.request()`.
-   */
   public request({
     op,
     transformer,
@@ -296,7 +310,6 @@ class IpcClient {
       TRPCClientError<AnyRouter>
     >((observer) => {
       const { type } = op;
-      /* istanbul ignore if -- @preserve */
       if (type === 'subscription') {
         throw new Error(
           'Subscriptions are unsupported by `ipcLink` - use `httpSubscriptionLink` or `wsLink`',
@@ -327,25 +340,16 @@ class IpcClient {
           observer.error(TRPCClientError.from(cause, { meta }));
         });
 
-      return () => {
-        // noop
-      };
+      return () => {};
     });
   }
 
-  /**
-   * Closes the IPC client: rejects all in-flight requests, kills the
-   * child process, and prevents any further requests.
-   *
-   * The returned promise resolves once the child has actually exited
-   * (or immediately if no child was ever spawned).
-   */
   public close(): Promise<void> {
     if (this.closed) {
       return Promise.resolve();
     }
     this.closed = true;
-
+    this.stopWatchdog();
     this.rejectAll(new TRPCIPCClosedError());
 
     const proc = this.child;
@@ -370,14 +374,6 @@ export type IPCLinkOptions<TRouter extends AnyRouter> = {
   client: TRPCIPCClient;
 } & TransformerOptions<inferClientTypes<TRouter>>;
 
-/**
- * A terminating link that talks to a child process over stdio using
- * newline-delimited JSON. The child process lifecycle is managed by a
- * separate `TRPCIPCClient` (created via `createIPCClient`), which
- * exposes `.close()` for graceful shutdown.
- *
- * @see https://trpc.io/docs/client/links/ipcLink
- */
 export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
   opts: IPCLinkOptions<TRouter>,
 ): TRPCLink<TRouter> {
@@ -400,3 +396,4 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
     };
   };
 }
+```
