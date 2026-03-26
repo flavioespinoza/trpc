@@ -1,4 +1,4 @@
-```typescript
+
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { observable } from '@trpc/server/observable';
 import type {
@@ -396,4 +396,3 @@ export function ipcLink<TRouter extends AnyRouter = AnyRouter>(
     };
   };
 }
-```
