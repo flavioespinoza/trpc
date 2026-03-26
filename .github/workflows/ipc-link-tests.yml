@@ -17,8 +17,8 @@ jobs:
       - name: setup-node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: '22' # Upgraded from 20 to avoid deprecation warnings
+          # Removed cache: 'npm' to bypass the lockfile requirement
 
       - name: install-dependencies
         run: npm install
