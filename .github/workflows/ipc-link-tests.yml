@@ -2,26 +2,18 @@ name: ipc-link-tests
 
 on:
   push:
-    branches: [ main, model_b ]
+    branches: [main, model_b]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   test-transport:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: checkout-code
-        uses: actions/checkout@v4
-
-      - name: setup-node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22' # Upgraded from 20 to avoid deprecation warnings
-          # Removed cache: 'npm' to bypass the lockfile requirement
-
-      - name: install-dependencies
-        run: npm install
+      - uses: actions/checkout@v6
+      - uses: ./.github/setup
 
       - name: run-transport-tests
-        run: npx vitest run packages/client/src/links/ipc-link.test.ts
+        run: pnpm vitest run packages/client/src/links/ipc-link.test.ts
